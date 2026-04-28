@@ -276,6 +276,10 @@ class GemmSm90:
 
         self.shared_storage = None
         self.buffer_align_bytes = 1024
+        # Number of int32s per scheduler-pipeline stage written to sched_smem.
+        # Default 4: (pid_m, pid_n, batch_idx, is_valid). Streaming subclasses
+        # bump this to 5 to also carry tile_id (the queue-pull index).
+        self.sched_payload_ints = 4
 
     def _setup_tiled_mma(self):
         """Set up tiled MMA and tile K dimension. Override for different MMA types."""
@@ -497,7 +501,7 @@ class GemmSm90:
             ab_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             epi_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.epi_c_stage * 2]
             sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.sched_stage * 2]
-            sched_data: cute.struct.MemRange[Int32, self.sched_stage * 4]
+            sched_data: cute.struct.MemRange[Int32, self.sched_stage * self.sched_payload_ints]
             sD: cute.struct.Align[
                 cute.struct.MemRange[
                     self.d_dtype if self.d_dtype is not None else Int32, epi_smem_size
@@ -647,7 +651,7 @@ class GemmSm90:
                 sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
                 varlen_k=varlen_k,
             )
-            sched_data = storage.sched_data.get_tensor((4, self.sched_stage))
+            sched_data = storage.sched_data.get_tensor((self.sched_payload_ints, self.sched_stage))
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk[:-1], is_relaxed=True)
@@ -707,7 +711,7 @@ class GemmSm90:
                 if const_expr(cute.size(cluster_layout_mnk) > 1):
                     is_scheduler_warp = is_scheduler_warp and cute.arch.block_idx_in_cluster() == 0
                 tile_scheduler = TileSchedulerCls()
-                work_tile = tile_scheduler.initial_work_tile_info()
+                work_tile = tile_scheduler.setup_initial_work_tile(is_scheduler_warp=is_scheduler_warp)
                 ab_producer_state = make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )
@@ -835,7 +839,7 @@ class GemmSm90:
                 pipeline.PipelineUserType.Producer, self.epi_c_stage
             )
             tile_scheduler = TileSchedulerCls()
-            work_tile = tile_scheduler.initial_work_tile_info()
+            work_tile = tile_scheduler.setup_initial_work_tile(is_scheduler_warp=False)
             if const_expr(self.pingpong):
                 if warp_idx >= 4:
                     # Advance 2nd Math WG pipeline states to the end of 1st Math WG

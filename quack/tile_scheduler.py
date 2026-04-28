@@ -30,6 +30,14 @@ class PersistenceMode(IntEnum):
     STATIC = 1
     DYNAMIC = 2
     CLC = 3
+    # STREAMING: persistent CTAs claim work via atomic_add on a dedicated
+    # consumer_head, with each linear work index decomposing into
+    # (streaming_tile_idx, pid_n). Each CTA acquire-spins on
+    # tile_ready_queue_seq[streaming_tile_idx] until the producer (e.g.
+    # DeepEP's streaming_slot_assign) releases the tile, then reads
+    # tile_id = tile_ready_queue[streaming_tile_idx] and the per-tile
+    # metadata (expert_id, recv_x_rows). Used by streaming-MoE kernel A.
+    STREAMING = 4
 
 
 @cute.jit
@@ -375,6 +383,17 @@ class TileScheduler:
         # work_tile_info = self._delinearize_work_idx(block_zero_only=True, loc=loc, ip=ip)
         # self.write_work_tile_to_smem(work_tile_info, loc=loc, ip=ip)
         # self.write_work_tile_to_smem(self._delinearize_work_idx(block_zero_only=True, loc=loc, ip=ip), loc=loc, ip=ip)
+
+    @cute.jit
+    def setup_initial_work_tile(
+        self, is_scheduler_warp: bool | Boolean = False, *, loc=None, ip=None
+    ) -> cutlass.utils.WorkTileInfo:
+        """Hook for schedulers that need to fetch the first work tile from a
+        producer (e.g. queue-pull) rather than decompose a static initial
+        `_current_work_idx`. Default: just calls `initial_work_tile_info()`.
+        Override in subclasses where the first tile must come from advance+get.
+        """
+        return self.initial_work_tile_info(loc=loc, ip=ip)
 
     @cute.jit
     def _fetch_next_work_idx(self, *, loc=None, ip=None) -> Int32 | Tuple[Int32, Int32, Boolean]:
@@ -1112,3 +1131,409 @@ class VarlenMTileScheduler(TileScheduler):
         self._current_batch_idx = batch_idx
         self._num_work_idx_before_cur_batch = num_work_idx_before_cur_batch
         return cutlass.utils.WorkTileInfo(tile_coord_mnkl, is_valid)
+
+
+class StreamingWorkTileInfo(cutlass.utils.WorkTileInfo):
+    """WorkTileInfo variant whose tile_idx carries 4 ints (pid_m, pid_n, tile_id,
+    batch_idx) rather than the standard 3 ints + None-K-slot. Used by
+    StreamingTileScheduler so the per-tile gather + postact overrides can read
+    tile_id directly from work_tile.tile_idx[2].
+    """
+
+    def __new_from_mlir_values__(self, values: list) -> "StreamingWorkTileInfo":
+        assert len(values) == 5, f"StreamingWorkTileInfo expects 5 values, got {len(values)}"
+        new_tile_idx = cutlass.new_from_mlir_values(self._tile_idx, values[:-1])
+        new_is_valid_tile = cutlass.new_from_mlir_values(self._is_valid_tile, [values[-1]])
+        return StreamingWorkTileInfo(new_tile_idx, new_is_valid_tile)
+
+
+@dataclass
+class StreamingTileSchedulerArguments:
+    """Arguments for the streaming-MoE tile scheduler. Produced by DeepEP's
+    Buffer.dispatch and consumed by the QuACK streaming kernel.
+
+    Linear-claim layout with per-tile ready signal:
+      * tile_ready[total_tiles] int64 — slot_assign release-stores dispatch_seq
+        into tile_ready[tile_id] when its tile_remaining hits zero. DeepEP's
+        slot_assign walks experts in expert-major order, so tile_ready flips
+        (becomes >= dispatch_seq) in expert-monotonic order.
+      * consumer_head is a single [1] int32 — one global atomic-add counter.
+        Linear claim order = tile_id order = expert-major order, so consumers
+        naturally converge on the same expert at the same time. No window, no
+        work-stealing, no per-CTA home expert.
+    """
+
+    problem_shape_ntile_mnl: cute.Shape  # (None, num_pid_n, num_local_experts)
+    consumer_head: cute.Tensor           # [1] int32 — global linear claim counter
+    tile_ready: cute.Tensor              # [total_tiles] int64 — release stamps from slot_assign
+    tile_records_expert_id: cute.Tensor  # [total_tiles] int32 — per-tile expert lookup
+    tile_records_recv_x_rows: cute.Tensor  # [total_tiles, tile_M] int32 — per-tile gather indices
+    dispatch_seq: Int32                  # int64 in real use; kept Int32 here for kernel arg convenience
+    total_tiles: Int32                   # passed as scalar so launch-time get_grid_shape doesn't deref device tensor
+    tile_shape_mn: cutlass.Constexpr[cute.Shape]  # (tile_M, tile_N)
+    cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
+    persistence_mode: cutlass.Constexpr[PersistenceMode] = PersistenceMode.STREAMING
+
+
+class StreamingTileScheduler(TileScheduler):
+    """Linear-claim tile scheduler for streaming-MoE kernel A.
+
+    Each persistent CTA's scheduler warp atomic-add-claims a linear work index
+    `linear_idx = atomic_add(consumer_head, 1)`. The linear index decomposes
+    into `(tile_id, pid_n) = divmod(linear_idx, num_pid_n)`. The scheduler
+    spins on `tile_ready[tile_id]` until the producer releases
+    (>= dispatch_seq), then reads `expert_id = tile_records_expert_id[tile_id]`.
+
+    Wave behavior for free: DeepEP's slot_assign walks experts in expert-major
+    order, firing tile_ready in tile_id order (since tile_id space is itself
+    expert-grouped via cumulative_tiles_before_e). Linear claim order ==
+    expert-major order, so 80 CTAs naturally converge on the same expert at the
+    same time and L2 holds 1-2 W1[e] slabs throughout. No active-expert window
+    or work-stealing logic in the scheduler.
+
+    The work tile produced for the consumer warps carries:
+      - `pid_m = 0` (each streaming tile is exactly tile_M rows; no per-tile M-tiling)
+      - `pid_n` (the N-stripe)
+      - `batch_idx = expert_id` (used by the existing kernel body to select W1[e])
+      - `tile_id` (carried in the SMEM payload at the K-slot position)
+
+    INTEGRATION NOTE: The existing `TileScheduler.write_work_tile_to_smem` writes
+    4 ints (pid_m, pid_n, batch_idx, is_valid) to `_sched_smem` for the consumer
+    warps. Streaming requires a 5th int — `tile_id` — so the consumer can use it
+    for both A's gather index lookup (`tile_records_recv_x_rows[tile_id, :]`) and
+    the postact_a destination (`postact_a[tile_id, :, pid_n × tile_N/2 : ...]`).
+    The `_sched_smem` allocation site (in the kernel) needs to bump from 4 to 5
+    ints; the `get_current_work` reader needs to unpack 5 ints; this class's
+    `write_work_tile_to_smem` writes the 5th int.
+    """
+
+    @dataclass
+    class Params:
+        consumer_head: cute.Tensor
+        tile_ready: cute.Tensor
+        tile_records_expert_id: cute.Tensor
+        tile_records_recv_x_rows: cute.Tensor
+        dispatch_seq: Int32
+        total_tiles: Int32
+        num_pid_n: Int32
+        num_pid_n_fdd: FastDivmod
+        tile_shape_mn: cutlass.Constexpr[cute.Shape]
+        cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
+        persistence_mode: cutlass.Constexpr[PersistenceMode]
+
+        @staticmethod
+        @cute.jit
+        def create(
+            args: StreamingTileSchedulerArguments, *, loc=None, ip=None
+        ) -> "StreamingTileScheduler.Params":
+            num_pid_n = cute.ceil_div(args.problem_shape_ntile_mnl[1], args.cluster_shape_mnk[1])
+            return StreamingTileScheduler.Params(
+                consumer_head=args.consumer_head,
+                tile_ready=args.tile_ready,
+                tile_records_expert_id=args.tile_records_expert_id,
+                tile_records_recv_x_rows=args.tile_records_recv_x_rows,
+                dispatch_seq=args.dispatch_seq,
+                total_tiles=args.total_tiles,
+                num_pid_n=num_pid_n,
+                num_pid_n_fdd=FastDivmod(num_pid_n),
+                tile_shape_mn=args.tile_shape_mn,
+                cluster_shape_mnk=args.cluster_shape_mnk,
+                persistence_mode=args.persistence_mode,
+            )
+
+    def __init__(
+        self,
+        current_work_idx: Int32,
+        num_tiles_executed: Int32,
+        current_tile_id: Int32,
+        current_expert: Int32,
+        current_pid_n: Int32,
+        sched_smem: Optional[cute.Tensor],
+        scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync],
+        pipeline_state: PipelineStateWAdvance,
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        # Streaming scheduler state, persisted across the persistent loop's
+        # iterations via the MLIR pytree round-trip:
+        #   _current_tile_id: tile_id derived from the most recent linear claim.
+        #     Used by _delinearize_work_idx and write_work_tile_to_smem so
+        #     consumer warps see (pid_m, pid_n, tile_id, batch_idx) and can do
+        #     per-tile gather + postact lookup.
+        #   _current_expert: tile_records_expert_id[tile_id] for the current
+        #     tile; surfaced via tile_coord_mnkl[3] for W1[e] selection.
+        #   _current_pid_n: the N-stripe of the most recently claimed work,
+        #     surfaced via tile_coord_mnkl[1].
+        self._current_work_idx = current_work_idx
+        self.num_tiles_executed = num_tiles_executed
+        self._current_tile_id = current_tile_id
+        self._current_expert = current_expert
+        self._current_pid_n = current_pid_n
+        self._sched_smem = sched_smem
+        self._scheduler_pipeline = scheduler_pipeline
+        self._pipeline_state = pipeline_state
+        self.params = params
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(args: StreamingTileSchedulerArguments, *, loc=None, ip=None) -> Params:
+        return StreamingTileScheduler.Params.create(args, loc=loc, ip=ip)
+
+    @staticmethod
+    @cute.jit
+    def create(
+        params: Params,
+        sched_smem: Optional[cute.Tensor] = None,
+        scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync] = None,
+        is_scheduler_warp: bool | Boolean = False,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "StreamingTileScheduler":
+        # Initial work index: each persistent CTA starts unclaimed (work_idx = -1
+        # means "not yet fetched"). The scheduler warp does its first
+        # atomic_add(consumer_head) inside _fetch_next_work_idx during the first
+        # advance_to_next_work call.
+        stages = const_expr(cute.size(sched_smem, mode=[1])) if sched_smem is not None else 0
+        return StreamingTileScheduler(
+            current_work_idx=Int32(-1),
+            num_tiles_executed=Int32(0),
+            current_tile_id=Int32(-1),
+            current_expert=Int32(0),
+            current_pid_n=Int32(0),
+            sched_smem=sched_smem,
+            scheduler_pipeline=scheduler_pipeline,
+            pipeline_state=PipelineStateWAdvance(stages, Int32(0), Int32(0), Int32(0)),
+            params=params,
+            loc=loc,
+            ip=ip,
+        )
+
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        max_active_clusters: Int32,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        # Grid is sized to fill compute SMs. total_tiles is passed as a scalar
+        # (not derived from cumulative_tiles_before_e[num_local_experts]) so
+        # we don't need to dereference a device tensor at host launch time.
+        total_work = params.total_tiles * params.num_pid_n
+        num_persistent_clusters = cutlass.min(
+            max_active_clusters, cute.ceil_div(total_work, cute.size(params.cluster_shape_mnk))
+        )
+        return (
+            params.cluster_shape_mnk[0],
+            params.cluster_shape_mnk[1],
+            params.cluster_shape_mnk[2] * num_persistent_clusters,
+        )
+
+    @cute.jit
+    def _fetch_next_work_idx(self, *, loc=None, ip=None) -> Int32:
+        """Scheduler-warp-only. Linear claim with per-tile ready spin.
+
+        Lane 0 does ``linear_idx = atomic_add(consumer_head, 1)``. If
+        ``linear_idx >= total_tiles * num_pid_n`` the kernel is exhausted and
+        we return is_valid=0; consumer warps see is_valid_tile=False and exit
+        the persistent loop. Otherwise:
+
+          1. Decompose ``(tile_id, pid_n) = divmod(linear_idx, num_pid_n)``.
+          2. Spin on ``tile_ready[tile_id]`` until value >= dispatch_seq —
+             slot_assign release-stores it once tile_remaining[tile_id] hits 0.
+          3. Read ``expert_id = tile_records_expert_id[tile_id]``.
+
+        Because slot_assign processes tokens in expert-major order (per the
+        pass-2 reorder in DeepEP), tile_ready flips in tile_id order and
+        linear-claim CTAs naturally walk experts in waves: 80 CTAs all start
+        on expert 0's tile range, drain it, advance to expert 1, etc.
+        """
+        params = self.params
+        total_work = params.total_tiles * params.num_pid_n
+        linear_idx = Int32(-1)
+        if cute.arch.lane_idx() == 0:
+            head_ptr = utils.elem_pointer(params.consumer_head, (Int32(0),))
+            linear_idx = utils.atomic_add_i32(1, head_ptr)
+        linear_idx = cute.arch.shuffle_sync(linear_idx, 0)
+
+        is_valid_i32 = Int32(linear_idx < total_work)
+        tile_id = Int32(-1)
+        pid_n = Int32(0)
+        expert_id = Int32(0)
+        if is_valid_i32 != 0:
+            tile_id, pid_n = divmod(linear_idx, params.num_pid_n_fdd)
+            if cute.arch.lane_idx() == 0:
+                ready_ptr = utils.elem_pointer(params.tile_ready, (tile_id,))
+                while utils.ld_acquire_sys_global(ready_ptr) < cutlass.Int64(params.dispatch_seq):
+                    pass
+                expert_id = params.tile_records_expert_id[tile_id]
+            expert_id = cute.arch.shuffle_sync(expert_id, 0)
+
+        self._current_tile_id = tile_id
+        self._current_expert = expert_id
+        self._current_pid_n = pid_n
+        return is_valid_i32
+
+    @cute.jit
+    def _delinearize_work_idx(
+        self,
+        work_idx: Int32,
+        bidz: Optional[Int32] = None,
+        is_valid: Optional[Boolean] = None,
+        *,
+        block_zero_only: bool = False,
+        loc=None,
+        ip=None,
+    ) -> cutlass.utils.WorkTileInfo:
+        # _fetch_next_work_idx stashed the per-expert claim result onto self
+        # and returned a 0/1 valid flag as the "linear work_idx" placeholder.
+        # All work-tile components were determined inside _fetch; just thread
+        # them through here.
+        if const_expr(is_valid is None):
+            is_valid = work_idx != Int32(0)
+        pid_m = Int32(0)  # streaming tiles are always exactly tile_M rows
+        # tile_coord_mnkl[2] (the K slot) carries tile_id for gather + postact;
+        # tile_coord_mnkl[3] (batch_idx) is the expert_id we just claimed work
+        # from, used by kernel body for W1[e] selection.
+        tile_coord_mnkl = (
+            pid_m,
+            self._current_pid_n,
+            self._current_tile_id,
+            self._current_expert,
+        )
+        return StreamingWorkTileInfo(tile_coord_mnkl, is_valid)
+
+    @cute.jit
+    def write_work_tile_to_smem(
+        self, work_tile_info: cutlass.utils.WorkTileInfo, *, loc=None, ip=None
+    ):
+        """Write 5 ints to _sched_smem: (pid_m, pid_n, tile_id, batch_idx=expert_id, is_valid).
+        The 5th int (tile_id) is the streaming-specific extension; the consumer
+        warps' get_current_work reader needs to unpack 5 ints in streaming mode.
+        """
+        params = self.params
+        if const_expr(self._sched_smem is not None):
+            pipeline_state_producer = PipelineStateWAdvance(
+                self._pipeline_state.stages,
+                self._pipeline_state.count,
+                self._pipeline_state.index,
+                self._pipeline_state.phase ^ 1,
+            )
+            self._scheduler_pipeline.producer_acquire(pipeline_state_producer)
+            sched_data = [
+                work_tile_info.tile_idx[0],  # pid_m
+                work_tile_info.tile_idx[1],  # pid_n
+                work_tile_info.tile_idx[2],  # tile_id (repurposed K slot)
+                work_tile_info.tile_idx[3],  # batch_idx = expert_id
+                Int32(work_tile_info.is_valid_tile),
+            ]
+            lane_idx = cute.arch.lane_idx()
+            # Streaming uses cluster_shape_mnk = (1, 1, 1); multi-cluster would
+            # need store_shared_remote_x5 (vs existing store_shared_remote_x4).
+            assert cute.size(params.cluster_shape_mnk) == 1, (
+                "StreamingTileScheduler currently requires cluster_shape == (1,1,1)"
+            )
+            if lane_idx < cute.size(params.cluster_shape_mnk):
+                pipeline_idx = self._pipeline_state.index
+                for i in cutlass.range_constexpr(5):
+                    self._sched_smem[i, pipeline_idx] = sched_data[i]
+                self._scheduler_pipeline.producer_commit(self._pipeline_state)
+
+    @cute.jit
+    def setup_initial_work_tile(
+        self, is_scheduler_warp: bool | Boolean = False, *, loc=None, ip=None
+    ) -> cutlass.utils.WorkTileInfo:
+        """For streaming, the first work tile must come from the producer's
+        atomic-claim + queue spin + sched_smem write — there is no static
+        initial `_current_work_idx`. Both producer and consumer warps call
+        this; producer's `advance_to_next_work` does the fetch+write, consumer's
+        is a no-op; both then read the populated sched_smem via
+        `get_current_work`.
+        """
+        self.advance_to_next_work(is_scheduler_warp=is_scheduler_warp, loc=loc, ip=ip)
+        return self.get_current_work(loc=loc, ip=ip)
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
+        """Streaming variant: unpacks 5 ints from sched_smem
+        (pid_m, pid_n, tile_id, batch_idx=expert_id, is_valid). The tile_id is
+        carried in tile_coord_mnkl[2] (the K slot — unused in GEMM context) so
+        the consumer (gather setup, postact setup) can read it.
+        """
+        params = self.params
+        self._scheduler_pipeline.consumer_wait(self._pipeline_state)
+        pid_m, pid_n, tile_id, batch_idx, is_valid_i32 = [
+            self._sched_smem[i, self._pipeline_state.index] for i in range(5)
+        ]
+        if const_expr(cute.size(params.cluster_shape_mnk) > 1):
+            cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            self._scheduler_pipeline.consumer_release(self._pipeline_state)
+        self._pipeline_state.advance()
+        tile_coord_mnkl = (pid_m, pid_n, tile_id, batch_idx)
+        return StreamingWorkTileInfo(tile_coord_mnkl, Boolean(is_valid_i32))
+
+    @cute.jit
+    def advance_to_next_work(
+        self,
+        is_scheduler_warp: bool | Boolean = False,
+        *,
+        advance_count: int = 1,
+        loc=None,
+        ip=None,
+    ):
+        """Streaming variant. Same flow as TileScheduler.advance_to_next_work but
+        always uses the STREAMING fetch path.
+        """
+        self.num_tiles_executed += Int32(advance_count)
+        if const_expr(self._pipeline_state is not None and advance_count > 1):
+            self._pipeline_state.advance_iters(advance_count - 1)
+        if is_scheduler_warp:
+            self._current_work_idx = self._fetch_next_work_idx(loc=loc, ip=ip)
+            work_tile_info = self._delinearize_work_idx(
+                self._current_work_idx, block_zero_only=True, loc=loc, ip=ip
+            )
+            self.write_work_tile_to_smem(work_tile_info, loc=loc, ip=ip)
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [
+            self._current_work_idx,
+            self.num_tiles_executed,
+            self._current_tile_id,
+            self._current_expert,
+            self._current_pid_n,
+            self._sched_smem,
+            self._scheduler_pipeline,
+            self._pipeline_state,
+            self.params,
+        ]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip(
+            [
+                self._current_work_idx,
+                self.num_tiles_executed,
+                self._current_tile_id,
+                self._current_expert,
+                self._current_pid_n,
+                self._sched_smem,
+                self._scheduler_pipeline,
+                self._pipeline_state,
+                self.params,
+            ],
+            self._values_pos,
+        ):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return self.__class__(*(tuple(obj_list)), loc=self._loc)
