@@ -362,7 +362,6 @@ def streaming_moe_a(
     tile_id_to_expert: torch.Tensor,          # (total_tiles,) int32
     expert_pool_block_offset: torch.Tensor,   # (E_local + 1,) int32 — pool-block prefix sum
     tile_ready: torch.Tensor,                 # (total_tiles,) int64 release stamps
-    consumer_head: torch.Tensor,              # (1,) int32, caller resets to 0
     dispatch_seq: int,
     *,
     tile_m: int = 128,
@@ -374,13 +373,17 @@ def streaming_moe_a(
     """Launch streaming-MoE kernel A on the caller's current CUDA stream (pool layout).
 
     Caller is responsible for:
-      - allocating postact_a as (total_tiles, tile_M, I) — kernel sees flat 2D.
-      - resetting consumer_head to 0 before launch.
-      - ensuring tile_ready is populated by the producer (DeepEP's
-        Buffer.dispatch Pass 2 or a test stub) on a stream that release-stores
-        tile_ready[tile_id] = dispatch_seq once the tile is ready.
-      - launching this kernel on a stream different from the producer's so the
-        per-tile spin actually waits rather than serializes.
+      - allocating ``postact_a`` ``(total_tiles, tile_M, I)`` ON THE SAME STREAM
+        this function is called from (so the kernel's TMA stores are naturally
+        ordered with the allocation; otherwise stale memory may leak through).
+      - ensuring ``tile_ready`` is populated by the producer (DeepEP's
+        ``Buffer.dispatch`` Pass 2 or a test stub) on a stream that release-stores
+        ``tile_ready[tile_id] = dispatch_seq`` once the tile is ready. Kernel A's
+        per-tile acquire-spin handles cross-stream visibility for ``tile_ready``
+        and the dispatch metadata it transitively depends on.
+
+    The internal ``consumer_head`` (per-call linear-claim counter) is allocated
+    on the calling stream so its zero-init is naturally ordered with the kernel.
 
     Numerical correctness: each CTA atomic-claims a linear work index, decomposes
     to (tile_id, pid_n), spins on tile_ready[tile_id], reads
@@ -397,7 +400,6 @@ def streaming_moe_a(
     assert postact_tile_m == tile_m
     assert tile_id_to_expert.shape == (total_tiles,)
     assert tile_ready.shape == (total_tiles,) and tile_ready.dtype == torch.int64
-    assert consumer_head.shape == (1,) and consumer_head.dtype == torch.int32
     H = pool.shape[1]
     E_local = W1.shape[0]
     assert expert_pool_block_offset.shape == (E_local + 1,)
@@ -451,6 +453,13 @@ def streaming_moe_a(
         return
 
     max_active_clusters = get_max_active_clusters(cluster_m * cluster_n)
+
+    # Internal scheduler counter — allocate on the calling stream (which is the
+    # one the kernel will run on) so the zero-init is naturally ordered with
+    # kernel A's `atomicAdd(consumer_head, 1)`. Allocating on a different stream
+    # would race with the kernel's first atomic-claim and could leak stale
+    # values from a recycled allocator slot, causing CTAs to early-exit.
+    consumer_head = torch.zeros(1, dtype=torch.int32, device=pool.device)
 
     epi_args = GemmGatedSm90.EpilogueArguments(
         mPostAct=postact_flat,
