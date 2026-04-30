@@ -1149,25 +1149,33 @@ class StreamingWorkTileInfo(cutlass.utils.WorkTileInfo):
 
 @dataclass
 class StreamingTileSchedulerArguments:
-    """Arguments for the streaming-MoE tile scheduler. Produced by DeepEP's
-    Buffer.dispatch and consumed by the QuACK streaming kernel.
+    """Arguments for the streaming-MoE tile scheduler (pool layout). Produced by
+    DeepEP's Buffer.dispatch and consumed by the QuACK streaming kernel.
 
     Linear-claim layout with per-tile ready signal:
-      * tile_ready[total_tiles] int64 — slot_assign release-stores dispatch_seq
-        into tile_ready[tile_id] when its tile_remaining hits zero. DeepEP's
-        slot_assign walks experts in expert-major order, so tile_ready flips
-        (becomes >= dispatch_seq) in expert-monotonic order.
+      * tile_ready[total_tiles] int64 — dispatch's Pass 2 release-stores
+        dispatch_seq into tile_ready[tile_id] once pool_arrival_count hits its
+        target for that tile. Pass 2 walks experts in order across substream
+        blocks, so tile_ready flips (becomes >= dispatch_seq) in expert-monotonic
+        order — kernel A's linear-claim CTAs naturally converge on the same
+        expert at the same time.
       * consumer_head is a single [1] int32 — one global atomic-add counter.
-        Linear claim order = tile_id order = expert-major order, so consumers
-        naturally converge on the same expert at the same time. No window, no
+        Linear claim order = tile_id order = expert-major order. No window, no
         work-stealing, no per-CTA home expert.
+
+    Pool layout: kernel A reads `pool` (expert-major, BLOCK_M-padded) via
+    standard strided TMA — no per-tile gather indirection. Each tile's m-row
+    range = `[tile_id * tile_M, (tile_id + 1) * tile_M)` in pool. The base
+    GEMM kernel's varlen_m path lands the right rows when given
+    ``cu_seqlens_m = expert_pool_block_offset * tile_m`` and the per-tile
+    pid_m = tile_id - expert_pool_block_offset[expert_id].
     """
 
     problem_shape_ntile_mnl: cute.Shape  # (None, num_pid_n, num_local_experts)
     consumer_head: cute.Tensor           # [1] int32 — global linear claim counter
-    tile_ready: cute.Tensor              # [total_tiles] int64 — release stamps from slot_assign
-    tile_records_expert_id: cute.Tensor  # [total_tiles] int32 — per-tile expert lookup
-    tile_records_recv_x_rows: cute.Tensor  # [total_tiles, tile_M] int32 — per-tile gather indices
+    tile_ready: cute.Tensor              # [total_tiles] int64 — release stamps from dispatch's Pass 2
+    tile_id_to_expert: cute.Tensor       # [total_tiles] int32 — per-tile expert lookup
+    expert_pool_block_offset: cute.Tensor  # [E_local + 1] int32 — pool-block prefix-sum (gives pid_m = tile_in_e)
     dispatch_seq: Int32                  # int64 in real use; kept Int32 here for kernel arg convenience
     total_tiles: Int32                   # passed as scalar so launch-time get_grid_shape doesn't deref device tensor
     tile_shape_mn: cutlass.Constexpr[cute.Shape]  # (tile_M, tile_N)
@@ -1176,43 +1184,40 @@ class StreamingTileSchedulerArguments:
 
 
 class StreamingTileScheduler(TileScheduler):
-    """Linear-claim tile scheduler for streaming-MoE kernel A.
+    """Linear-claim tile scheduler for streaming-MoE kernel A (pool layout).
 
     Each persistent CTA's scheduler warp atomic-add-claims a linear work index
     `linear_idx = atomic_add(consumer_head, 1)`. The linear index decomposes
     into `(tile_id, pid_n) = divmod(linear_idx, num_pid_n)`. The scheduler
-    spins on `tile_ready[tile_id]` until the producer releases
-    (>= dispatch_seq), then reads `expert_id = tile_records_expert_id[tile_id]`.
+    spins on `tile_ready[tile_id]` until dispatch's Pass 2 releases
+    (>= dispatch_seq), then reads `expert_id = tile_id_to_expert[tile_id]` and
+    `pid_m = tile_id - expert_pool_block_offset[expert_id]` (= tile_in_e).
+    The standard varlen_m path's `cu_seqlens_m[expert_id] + pid_m * tile_m`
+    formula then lands the correct pool row.
 
-    Wave behavior for free: DeepEP's slot_assign walks experts in expert-major
-    order, firing tile_ready in tile_id order (since tile_id space is itself
-    expert-grouped via cumulative_tiles_before_e). Linear claim order ==
-    expert-major order, so 80 CTAs naturally converge on the same expert at the
-    same time and L2 holds 1-2 W1[e] slabs throughout. No active-expert window
-    or work-stealing logic in the scheduler.
+    Wave behavior for free: dispatch's Pass 2 fires tile_ready in expert-major
+    order at substream end. Linear claim order == tile_id order == expert-major
+    order, so 80 CTAs naturally converge on the same expert at the same time
+    and L2 holds 1-2 W1[e] slabs throughout. No active-expert window or
+    work-stealing logic in the scheduler.
 
     The work tile produced for the consumer warps carries:
-      - `pid_m = 0` (each streaming tile is exactly tile_M rows; no per-tile M-tiling)
+      - `pid_m = tile_in_e` (drives the cu_seqlens_m row offset)
       - `pid_n` (the N-stripe)
-      - `batch_idx = expert_id` (used by the existing kernel body to select W1[e])
-      - `tile_id` (carried in the SMEM payload at the K-slot position)
+      - `tile_id` (used by epi_setup_postact for the per-tile postact_a slab)
+      - `batch_idx = expert_id` (used by the kernel body to select W1[e])
 
-    INTEGRATION NOTE: The existing `TileScheduler.write_work_tile_to_smem` writes
-    4 ints (pid_m, pid_n, batch_idx, is_valid) to `_sched_smem` for the consumer
-    warps. Streaming requires a 5th int — `tile_id` — so the consumer can use it
-    for both A's gather index lookup (`tile_records_recv_x_rows[tile_id, :]`) and
-    the postact_a destination (`postact_a[tile_id, :, pid_n × tile_N/2 : ...]`).
-    The `_sched_smem` allocation site (in the kernel) needs to bump from 4 to 5
-    ints; the `get_current_work` reader needs to unpack 5 ints; this class's
-    `write_work_tile_to_smem` writes the 5th int.
+    INTEGRATION NOTE: 5 ints in the sched payload — (pid_m, pid_n, tile_id,
+    batch_idx, is_valid). tile_id is carried alongside (pid_m, expert_id)
+    because the postact_a destination is still tile-id-keyed.
     """
 
     @dataclass
     class Params:
         consumer_head: cute.Tensor
         tile_ready: cute.Tensor
-        tile_records_expert_id: cute.Tensor
-        tile_records_recv_x_rows: cute.Tensor
+        tile_id_to_expert: cute.Tensor
+        expert_pool_block_offset: cute.Tensor
         dispatch_seq: Int32
         total_tiles: Int32
         num_pid_n: Int32
@@ -1230,8 +1235,8 @@ class StreamingTileScheduler(TileScheduler):
             return StreamingTileScheduler.Params(
                 consumer_head=args.consumer_head,
                 tile_ready=args.tile_ready,
-                tile_records_expert_id=args.tile_records_expert_id,
-                tile_records_recv_x_rows=args.tile_records_recv_x_rows,
+                tile_id_to_expert=args.tile_id_to_expert,
+                expert_pool_block_offset=args.expert_pool_block_offset,
                 dispatch_seq=args.dispatch_seq,
                 total_tiles=args.total_tiles,
                 num_pid_n=num_pid_n,
@@ -1247,6 +1252,7 @@ class StreamingTileScheduler(TileScheduler):
         num_tiles_executed: Int32,
         current_tile_id: Int32,
         current_expert: Int32,
+        current_pid_m: Int32,
         current_pid_n: Int32,
         sched_smem: Optional[cute.Tensor],
         scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync],
@@ -1259,17 +1265,21 @@ class StreamingTileScheduler(TileScheduler):
         # Streaming scheduler state, persisted across the persistent loop's
         # iterations via the MLIR pytree round-trip:
         #   _current_tile_id: tile_id derived from the most recent linear claim.
-        #     Used by _delinearize_work_idx and write_work_tile_to_smem so
-        #     consumer warps see (pid_m, pid_n, tile_id, batch_idx) and can do
-        #     per-tile gather + postact lookup.
-        #   _current_expert: tile_records_expert_id[tile_id] for the current
-        #     tile; surfaced via tile_coord_mnkl[3] for W1[e] selection.
+        #     Carried as tile_coord_mnkl[2] so the postact_a destination override
+        #     can compute `tile_id * tile_m` row offset.
+        #   _current_expert: tile_id_to_expert[tile_id] for the current tile;
+        #     surfaced via tile_coord_mnkl[3] for W1[e] selection.
+        #   _current_pid_m: tile_in_e = tile_id - expert_pool_block_offset[expert_id].
+        #     Drives the standard varlen_m path's m-offset calculation
+        #     (`cu_seqlens_m[expert_id] + pid_m * tile_m`) which lands at the
+        #     correct pool row.
         #   _current_pid_n: the N-stripe of the most recently claimed work,
         #     surfaced via tile_coord_mnkl[1].
         self._current_work_idx = current_work_idx
         self.num_tiles_executed = num_tiles_executed
         self._current_tile_id = current_tile_id
         self._current_expert = current_expert
+        self._current_pid_m = current_pid_m
         self._current_pid_n = current_pid_n
         self._sched_smem = sched_smem
         self._scheduler_pipeline = scheduler_pipeline
@@ -1303,6 +1313,7 @@ class StreamingTileScheduler(TileScheduler):
             num_tiles_executed=Int32(0),
             current_tile_id=Int32(-1),
             current_expert=Int32(0),
+            current_pid_m=Int32(0),
             current_pid_n=Int32(0),
             sched_smem=sched_smem,
             scheduler_pipeline=scheduler_pipeline,
@@ -1344,13 +1355,18 @@ class StreamingTileScheduler(TileScheduler):
 
           1. Decompose ``(tile_id, pid_n) = divmod(linear_idx, num_pid_n)``.
           2. Spin on ``tile_ready[tile_id]`` until value >= dispatch_seq —
-             slot_assign release-stores it once tile_remaining[tile_id] hits 0.
-          3. Read ``expert_id = tile_records_expert_id[tile_id]``.
+             dispatch's Pass 2 release-stores it once pool_arrival_count
+             reaches its target for that tile.
+          3. Read ``expert_id = tile_id_to_expert[tile_id]``.
+          4. Compute ``pid_m = tile_id - expert_pool_block_offset[expert_id]``
+             (= tile_in_e). Combined with the consumer's varlen_m path that
+             reads ``cu_seqlens_m = expert_pool_block_offset * tile_m``, the
+             m-offset ``cu_seqlens_m[expert_id] + pid_m * tile_m`` lands at
+             the correct pool row.
 
-        Because slot_assign processes tokens in expert-major order (per the
-        pass-2 reorder in DeepEP), tile_ready flips in tile_id order and
-        linear-claim CTAs naturally walk experts in waves: 80 CTAs all start
-        on expert 0's tile range, drain it, advance to expert 1, etc.
+        Because dispatch's Pass 2 fires tile_ready in expert-major order at
+        substream end, linear-claim CTAs naturally walk experts in waves: 80
+        CTAs all start on expert 0's tile range, drain it, advance to expert 1, etc.
         """
         params = self.params
         total_work = params.total_tiles * params.num_pid_n
@@ -1363,6 +1379,7 @@ class StreamingTileScheduler(TileScheduler):
         is_valid_i32 = Int32(linear_idx < total_work)
         tile_id = Int32(-1)
         pid_n = Int32(0)
+        pid_m = Int32(0)
         expert_id = Int32(0)
         if is_valid_i32 != 0:
             tile_id, pid_n = divmod(linear_idx, params.num_pid_n_fdd)
@@ -1370,11 +1387,14 @@ class StreamingTileScheduler(TileScheduler):
                 ready_ptr = utils.elem_pointer(params.tile_ready, (tile_id,))
                 while utils.ld_acquire_sys_global(ready_ptr) < cutlass.Int64(params.dispatch_seq):
                     pass
-                expert_id = params.tile_records_expert_id[tile_id]
+                expert_id = params.tile_id_to_expert[tile_id]
+                pid_m = tile_id - params.expert_pool_block_offset[expert_id]
             expert_id = cute.arch.shuffle_sync(expert_id, 0)
+            pid_m = cute.arch.shuffle_sync(pid_m, 0)
 
         self._current_tile_id = tile_id
         self._current_expert = expert_id
+        self._current_pid_m = pid_m
         self._current_pid_n = pid_n
         return is_valid_i32
 
@@ -1389,18 +1409,14 @@ class StreamingTileScheduler(TileScheduler):
         loc=None,
         ip=None,
     ) -> cutlass.utils.WorkTileInfo:
-        # _fetch_next_work_idx stashed the per-expert claim result onto self
-        # and returned a 0/1 valid flag as the "linear work_idx" placeholder.
-        # All work-tile components were determined inside _fetch; just thread
-        # them through here.
+        # _fetch_next_work_idx stashed the per-tile claim result onto self.
         if const_expr(is_valid is None):
             is_valid = work_idx != Int32(0)
-        pid_m = Int32(0)  # streaming tiles are always exactly tile_M rows
-        # tile_coord_mnkl[2] (the K slot) carries tile_id for gather + postact;
-        # tile_coord_mnkl[3] (batch_idx) is the expert_id we just claimed work
-        # from, used by kernel body for W1[e] selection.
+        # tile_coord_mnkl[0] (pid_m): tile_in_e — drives varlen_m m-offset.
+        # tile_coord_mnkl[2] (the K slot): tile_id — used by epi_setup_postact.
+        # tile_coord_mnkl[3] (batch_idx): expert_id — used by kernel body for W1[e].
         tile_coord_mnkl = (
-            pid_m,
+            self._current_pid_m,
             self._current_pid_n,
             self._current_tile_id,
             self._current_expert,
@@ -1507,6 +1523,7 @@ class StreamingTileScheduler(TileScheduler):
             self.num_tiles_executed,
             self._current_tile_id,
             self._current_expert,
+            self._current_pid_m,
             self._current_pid_n,
             self._sched_smem,
             self._scheduler_pipeline,
@@ -1526,6 +1543,7 @@ class StreamingTileScheduler(TileScheduler):
                 self.num_tiles_executed,
                 self._current_tile_id,
                 self._current_expert,
+                self._current_pid_m,
                 self._current_pid_n,
                 self._sched_smem,
                 self._scheduler_pipeline,
