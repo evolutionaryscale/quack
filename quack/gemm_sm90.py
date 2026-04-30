@@ -1284,6 +1284,7 @@ class GemmSm90:
                 epi_producer_state.advance()
             tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
             # Convert and store postact if this epilogue produces one
+            tRS_rPostAct_out = None
             if const_expr(postact_ctx is not None):
                 tRS_rPostAct_out = self.epi_convert_postact(
                     tRS_rPostAct,
@@ -1293,52 +1294,25 @@ class GemmSm90:
                     num_prev_subtiles,
                     epi_idx,
                 )
-            if is_tma_warp:
-                epi_store_pipeline.producer_acquire()
-            epilogue_barrier.arrive_and_wait()
-            # Copy from D registers to shared memory
-            epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
-            if const_expr(has_D):
-                if const_expr(
-                    self.rounding_mode == RoundingMode.RS
-                    and self.acc_dtype == cutlass.Float32
-                    and self.d_dtype == cutlass.BFloat16
-                ):
-                    seed = epi_loop_tensors["sr_seed"] + (
-                        tile_coord_mnkl[0] * 65537
-                        + tile_coord_mnkl[1] * 257
-                        + tile_coord_mnkl[3] * 17
-                        + (num_prev_subtiles + epi_idx) * 7
-                    )
-                    copy_utils.sr_cvt_copy(
-                        tiled_copy_r2s,
-                        tRS_rD,
-                        tRS_sD[None, None, None, epi_buffer],
-                        seed,
-                        tidx,
-                    )
-                else:
-                    copy_utils.cvt_copy(
-                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer]
-                    )
-            # Copy postact from registers to shared memory
-            if const_expr(postact_ctx is not None):
-                tiled_copy_postact_r2s, tRS_sPostAct, copy_postact = postact_ctx
-                cute.copy(
-                    tiled_copy_postact_r2s,
-                    tiled_copy_postact_r2s.retile(tRS_rPostAct_out),
-                    tRS_sPostAct[None, None, None, epi_buffer],
-                )
-            # Fence and barrier to make sure shared memory store is visible to TMA store
-            cute.arch.fence_view_async_shared()
-            epilogue_barrier.arrive_and_wait()
-            # Copy from shared memory to global memory
-            if is_tma_warp:
-                if const_expr(has_D):
-                    copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
-                if const_expr(postact_ctx is not None):
-                    copy_postact(src_idx=epi_buffer, dst_idx=epi_coord)
-                epi_store_pipeline.producer_commit()
+            self.epi_subtile_store(
+                params,
+                epi_loop_tensors,
+                tRS_rD,
+                tRS_sD,
+                tiled_copy_r2s,
+                copy_D,
+                has_D,
+                postact_ctx,
+                tRS_rPostAct_out,
+                epi_store_pipeline,
+                epilogue_barrier,
+                tile_coord_mnkl,
+                epi_coord,
+                num_prev_subtiles,
+                epi_idx,
+                tidx,
+                is_tma_warp,
+            )
 
         self.epi_end(
             params,
@@ -1352,6 +1326,85 @@ class GemmSm90:
         )
 
         return epi_read_state, epi_producer_state
+
+    @cute.jit
+    def epi_subtile_store(
+        self,
+        params,
+        epi_loop_tensors,
+        tRS_rD: cute.Tensor,
+        tRS_sD: cute.Tensor,
+        tiled_copy_r2s: cute.TiledCopy,
+        copy_D: Optional[Callable],
+        has_D: cutlass.Constexpr,
+        postact_ctx: Optional[Tuple],
+        tRS_rPostAct_out: Optional[cute.Tensor],
+        epi_store_pipeline: cutlass.pipeline.PipelineAsync,
+        epilogue_barrier: cutlass.pipeline.NamedBarrier,
+        tile_coord_mnkl: cute.Coord,
+        epi_coord: cute.Coord,
+        num_prev_subtiles: Int32,
+        epi_idx: Int32,
+        tidx: Int32,
+        is_tma_warp: Boolean,
+    ) -> None:
+        """Per-subtile store hook called from `epilogue()` after `epi_visit_subtile`.
+
+        Default behavior: producer-acquire the TMA store pipeline, R2S-copy the
+        register accumulator (and any postact register tensor) into the SMEM
+        staging buffer, fence, then TMA-store both to GMEM and producer-commit
+        the pipeline stage.
+
+        Subclasses may override to swap the GMEM-write path — e.g., a
+        downstream MoE epilogue can do per-row atomic-scatter from the SMEM
+        staging buffer instead of TMA bulk store.
+        """
+        if is_tma_warp:
+            epi_store_pipeline.producer_acquire()
+        epilogue_barrier.arrive_and_wait()
+        # Copy from D registers to shared memory
+        epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
+        if const_expr(has_D):
+            if const_expr(
+                self.rounding_mode == RoundingMode.RS
+                and self.acc_dtype == cutlass.Float32
+                and self.d_dtype == cutlass.BFloat16
+            ):
+                seed = epi_loop_tensors["sr_seed"] + (
+                    tile_coord_mnkl[0] * 65537
+                    + tile_coord_mnkl[1] * 257
+                    + tile_coord_mnkl[3] * 17
+                    + (num_prev_subtiles + epi_idx) * 7
+                )
+                copy_utils.sr_cvt_copy(
+                    tiled_copy_r2s,
+                    tRS_rD,
+                    tRS_sD[None, None, None, epi_buffer],
+                    seed,
+                    tidx,
+                )
+            else:
+                copy_utils.cvt_copy(
+                    tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer]
+                )
+        # Copy postact from registers to shared memory
+        if const_expr(postact_ctx is not None):
+            tiled_copy_postact_r2s, tRS_sPostAct, copy_postact = postact_ctx
+            cute.copy(
+                tiled_copy_postact_r2s,
+                tiled_copy_postact_r2s.retile(tRS_rPostAct_out),
+                tRS_sPostAct[None, None, None, epi_buffer],
+            )
+        # Fence and barrier to make sure shared memory store is visible to TMA store
+        cute.arch.fence_view_async_shared()
+        epilogue_barrier.arrive_and_wait()
+        # Copy from shared memory to global memory
+        if is_tma_warp:
+            if const_expr(has_D):
+                copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
+            if const_expr(postact_ctx is not None):
+                copy_postact(src_idx=epi_buffer, dst_idx=epi_coord)
+            epi_store_pipeline.producer_commit()
 
     def get_scheduler_class(self, varlen_m: bool = False):
         """Return the scheduler class to use. Override in subclasses for custom schedulers."""
