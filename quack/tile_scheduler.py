@@ -31,12 +31,14 @@ class PersistenceMode(IntEnum):
     DYNAMIC = 2
     CLC = 3
     # STREAMING: persistent CTAs claim work via atomic_add on a dedicated
-    # consumer_head, with each linear work index decomposing into
-    # (streaming_tile_idx, pid_n). Each CTA acquire-spins on
-    # tile_ready_queue_seq[streaming_tile_idx] until the producer (e.g.
-    # DeepEP's streaming_slot_assign) releases the tile, then reads
-    # tile_id = tile_ready_queue[streaming_tile_idx] and the per-tile
-    # metadata (expert_id, recv_x_rows). Used by streaming-MoE kernel A.
+    # consumer_head; each linear work index decomposes into (tile_id, pid_n).
+    # Each CTA acquire-spins on tile_ready[tile_id] (int64, dispatch_seq stamp)
+    # until the producer (DeepEP dispatch's Pass 2) releases the tile, then
+    # reads expert_id = tile_id_to_expert[tile_id] and computes
+    # pid_m = tile_id - expert_pool_block_offset[expert_id]. Pool layout means
+    # the pool row offset = cu_seqlens_m[expert_id] + pid_m * tile_m lands at
+    # the right rows via the standard varlen_m TMA path — no per-tile gather.
+    # Used by streaming-MoE kernel A.
     STREAMING = 4
 
 

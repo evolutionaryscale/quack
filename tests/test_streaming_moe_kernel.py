@@ -1,19 +1,25 @@
-"""Tests for the streaming-MoE kernel A.
+"""Tests for the streaming-MoE kernel A (pool layout).
 
 These tests exercise the streaming-design properties directly:
   - test_compile: kernel compiles for a representative shape.
-  - test_single_tile: total_tiles=1, tile_ready pre-set, validates IP1+IP2+IP3
-    wiring + per-tile spin-then-read. Numerics: gather + matmul + SwiGLU
-    against an eager pytorch reference.
-  - test_multi_tile_static: total_tiles=N, all tile_ready slots pre-set,
-    persistent CTAs absorb all tiles.
+  - test_single_tile: total_tiles=1, tile_ready pre-set. Numerics: matmul +
+    SwiGLU on pool[0:tile_m, :] vs an eager pytorch reference.
+  - test_multi_tile_static: total_tiles=N spread across multiple experts via
+    expert_pool_block_offset; all tile_ready slots pre-set, persistent CTAs
+    absorb all tiles.
   - test_producer_consumer: producer kernel on a different stream fires
     tile_ready entries with delay; kernel A spins then drains.
 
 Linear-claim layout:
-  * tile_ready[total_tiles] int64 — release stamps from slot_assign (or test
-    stub). Consumer spins until tile_ready[tile_id] >= dispatch_seq.
-  * consumer_head[1] int32 — single global atomic-add counter for linear claims.
+  * tile_ready[total_tiles] int64 — release stamps from dispatch's Pass 2 (or
+    a test stub). Consumer spins until tile_ready[tile_id] >= dispatch_seq.
+  * Internal consumer_head[1] int32 (allocated inside `streaming_moe_a`) —
+    single global atomic-add counter for linear claims.
+
+Pool layout:
+  * pool[total_tiles * tile_m, H] is expert-major and BLOCK_M-padded; tile t
+    occupies rows [t*tile_m, (t+1)*tile_m) and belongs to
+    expert_id = tile_id_to_expert[t].
 """
 
 from __future__ import annotations
@@ -40,6 +46,27 @@ def _make_tile_ready(total_tiles: int, dispatch_seq: int, device, fired: bool = 
     return torch.full((total_tiles,), val, dtype=torch.int64, device=device)
 
 
+def _make_tile_metadata(tile_to_expert_list, E_local, device):
+    """Build (tile_id_to_expert, expert_pool_block_offset) from a list mapping
+    each tile_id to its expert. Tiles must already be in expert-major order
+    (i.e. all tiles for expert e come before any tile for expert e+1)."""
+    total_tiles = len(tile_to_expert_list)
+    tile_id_to_expert = torch.tensor(tile_to_expert_list, dtype=torch.int32, device=device)
+    expert_pool_block_offset = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
+    counts = [0] * E_local
+    for e in tile_to_expert_list:
+        counts[e] += 1
+    cum = 0
+    for e in range(E_local):
+        expert_pool_block_offset[e] = cum
+        cum += counts[e]
+    expert_pool_block_offset[E_local] = cum
+    assert cum == total_tiles, (
+        f"tile_to_expert_list must be expert-major and contiguous; got {tile_to_expert_list}"
+    )
+    return tile_id_to_expert, expert_pool_block_offset
+
+
 @pytest.fixture
 def device():
     if not torch.cuda.is_available():
@@ -54,30 +81,26 @@ def test_streaming_moe_a_compiles(device):
     H, I, E_local = 128, 256, 4
     tile_m, tile_n = 128, 256
     total_tiles = 4
-    T_recv = total_tiles * tile_m
+    TK_padded = total_tiles * tile_m
 
     dtype = torch.bfloat16
-    recv_x = torch.randn(T_recv, H, dtype=dtype, device=device)
+    pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
     W1 = torch.randn(E_local, 2 * I, H, dtype=dtype, device=device).mul_(0.02)
     postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
 
-    tile_records_recv_x_rows = (
-        torch.arange(total_tiles * tile_m, dtype=torch.int32, device=device)
-        .view(total_tiles, tile_m)
-    )
-    tile_records_expert_id = torch.zeros(total_tiles, dtype=torch.int32, device=device)
+    # All 4 tiles belong to expert 0.
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
+        [0, 0, 0, 0], E_local, device)
     tile_ready = _make_tile_ready(total_tiles, dispatch_seq=1, device=device)
-    consumer_head = torch.zeros(1, dtype=torch.int32, device=device)
 
     import quack.cache_utils as cu
     orig = cu.COMPILE_ONLY
     cu.COMPILE_ONLY = True
     try:
         streaming_moe_a(
-            recv_x, W1, postact_a,
-            tile_records_recv_x_rows, tile_records_expert_id,
-            tile_ready, consumer_head,
-            dispatch_seq=1,
+            pool, W1, postact_a,
+            tile_id_to_expert, expert_pool_block_offset,
+            tile_ready, dispatch_seq=1,
             tile_m=tile_m, tile_n=tile_n,
         )
     finally:
@@ -86,42 +109,37 @@ def test_streaming_moe_a_compiles(device):
 
 def test_streaming_moe_a_single_tile(device):
     """total_tiles=1, tile_ready pre-set. Validates the full kernel path:
-    linear claim, scheduler 5-int payload, per-tile gather, per-tile postact,
-    expert lookup via tile_records_expert_id.
+    linear claim, scheduler 5-int payload, strided pool read, per-tile postact,
+    expert lookup via tile_id_to_expert.
     """
     from quack.moe_streaming_sm90 import streaming_moe_a
 
     H, I, E_local = 128, 256, 4
     tile_m, tile_n = 128, 256
     total_tiles = 1
-    T_recv = 256
+    TK_padded = total_tiles * tile_m
+    chosen_expert = 2
 
     dtype = torch.bfloat16
     torch.manual_seed(0)
-    recv_x = torch.randn(T_recv, H, dtype=dtype, device=device)
+    pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
     W1 = torch.randn(E_local, 2 * I, H, dtype=dtype, device=device).mul_(0.02)
-
-    chosen_expert = 2
-    chosen_rows = torch.randperm(T_recv, device=device)[:tile_m].to(torch.int32)
-
     postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
-    tile_records_recv_x_rows = chosen_rows.view(1, tile_m).contiguous()
-    tile_records_expert_id = torch.tensor([chosen_expert], dtype=torch.int32, device=device)
 
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
+        [chosen_expert], E_local, device)
     tile_ready = _make_tile_ready(total_tiles, dispatch_seq=1, device=device)
-    consumer_head = torch.zeros(1, dtype=torch.int32, device=device)
 
     streaming_moe_a(
-        recv_x, W1, postact_a,
-        tile_records_recv_x_rows, tile_records_expert_id,
-        tile_ready, consumer_head,
-        dispatch_seq=1,
+        pool, W1, postact_a,
+        tile_id_to_expert, expert_pool_block_offset,
+        tile_ready, dispatch_seq=1,
         tile_m=tile_m, tile_n=tile_n,
     )
     torch.cuda.synchronize()
 
-    x_gathered = recv_x[chosen_rows.long()]
-    h = x_gathered.float() @ W1[chosen_expert].float().t()
+    x_tile = pool[0:tile_m, :]
+    h = x_tile.float() @ W1[chosen_expert].float().t()
     a_ref = _swiglu_ref(h).to(dtype)
 
     a_kernel = postact_a[0]
@@ -133,48 +151,43 @@ def test_streaming_moe_a_single_tile(device):
 
 
 def test_streaming_moe_a_multi_tile_static(device):
-    """total_tiles=N>1 spread across multiple experts. Validates per-tile
-    expert selection (W1[expert_id] varies), per-tile gather indices, and
-    persistent kernel termination via the linear-claim bounds check.
+    """total_tiles=N>1 spread across multiple experts via expert_pool_block_offset.
+    Validates per-tile expert selection (W1[expert_id] varies via
+    tile_id_to_expert) and persistent kernel termination via the linear-claim
+    bounds check.
     """
     from quack.moe_streaming_sm90 import streaming_moe_a
 
     H, I, E_local = 128, 256, 4
     tile_m, tile_n = 128, 256
-    total_tiles = 6
-    T_recv = 1024
+    # Expert-major distribution: expert 0: 2 tiles, expert 1: 1 tile,
+    # expert 2: 2 tiles, expert 3: 1 tile.  total_tiles = 6.
+    tile_to_expert_list = [0, 0, 1, 2, 2, 3]
+    total_tiles = len(tile_to_expert_list)
+    TK_padded = total_tiles * tile_m
 
     dtype = torch.bfloat16
     torch.manual_seed(7)
-    recv_x = torch.randn(T_recv, H, dtype=dtype, device=device)
+    pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
     W1 = torch.randn(E_local, 2 * I, H, dtype=dtype, device=device).mul_(0.02)
-
-    tile_records_expert_id = torch.tensor(
-        [t % E_local for t in range(total_tiles)], dtype=torch.int32, device=device
-    )
-    tile_records_recv_x_rows = torch.empty(total_tiles, tile_m, dtype=torch.int32, device=device)
-    for t in range(total_tiles):
-        g = torch.Generator(device=device).manual_seed(100 + t)
-        tile_records_recv_x_rows[t] = torch.randperm(T_recv, generator=g, device=device)[:tile_m].to(torch.int32)
-
     postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
+
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
+        tile_to_expert_list, E_local, device)
     tile_ready = _make_tile_ready(total_tiles, dispatch_seq=1, device=device)
-    consumer_head = torch.zeros(1, dtype=torch.int32, device=device)
 
     streaming_moe_a(
-        recv_x, W1, postact_a,
-        tile_records_recv_x_rows, tile_records_expert_id,
-        tile_ready, consumer_head,
-        dispatch_seq=1,
+        pool, W1, postact_a,
+        tile_id_to_expert, expert_pool_block_offset,
+        tile_ready, dispatch_seq=1,
         tile_m=tile_m, tile_n=tile_n,
     )
     torch.cuda.synchronize()
 
     for t in range(total_tiles):
-        e = tile_records_expert_id[t].item()
-        rows = tile_records_recv_x_rows[t].long()
-        x_gathered = recv_x[rows]
-        h = x_gathered.float() @ W1[e].float().t()
+        e = tile_to_expert_list[t]
+        x_tile = pool[t * tile_m:(t + 1) * tile_m, :]
+        h = x_tile.float() @ W1[e].float().t()
         a_ref = _swiglu_ref(h).to(dtype)
         diff = (postact_a[t].float() - a_ref.float()).abs()
         rel = diff / (a_ref.float().abs() + 1e-3)
@@ -193,25 +206,19 @@ def test_streaming_moe_a_producer_consumer(device):
 
     H, I, E_local = 128, 256, 4
     tile_m, tile_n = 128, 256
-    total_tiles = 6
-    T_recv = 1024
+    tile_to_expert_list = [0, 0, 1, 2, 2, 3]
+    total_tiles = len(tile_to_expert_list)
+    TK_padded = total_tiles * tile_m
 
     dtype = torch.bfloat16
     torch.manual_seed(11)
-    recv_x = torch.randn(T_recv, H, dtype=dtype, device=device)
+    pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
     W1 = torch.randn(E_local, 2 * I, H, dtype=dtype, device=device).mul_(0.02)
-
-    tile_records_expert_id = torch.tensor(
-        [t % E_local for t in range(total_tiles)], dtype=torch.int32, device=device
-    )
-    tile_records_recv_x_rows = torch.empty(total_tiles, tile_m, dtype=torch.int32, device=device)
-    for t in range(total_tiles):
-        g = torch.Generator(device=device).manual_seed(200 + t)
-        tile_records_recv_x_rows[t] = torch.randperm(T_recv, generator=g, device=device)[:tile_m].to(torch.int32)
-
     postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
+
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
+        tile_to_expert_list, E_local, device)
     tile_ready = _make_tile_ready(total_tiles, dispatch_seq=1, device=device, fired=False)
-    consumer_head = torch.zeros(1, dtype=torch.int32, device=device)
 
     # Pre-warm the producer JIT compile so the host doesn't block during the
     # concurrent launch (use dispatch_seq=999 then reset).
@@ -225,10 +232,9 @@ def test_streaming_moe_a_producer_consumer(device):
 
     with torch.cuda.stream(compute_a_stream):
         streaming_moe_a(
-            recv_x, W1, postact_a,
-            tile_records_recv_x_rows, tile_records_expert_id,
-            tile_ready, consumer_head,
-            dispatch_seq=1,
+            pool, W1, postact_a,
+            tile_id_to_expert, expert_pool_block_offset,
+            tile_ready, dispatch_seq=1,
             tile_m=tile_m, tile_n=tile_n,
         )
     with torch.cuda.stream(producer_stream):
@@ -237,10 +243,9 @@ def test_streaming_moe_a_producer_consumer(device):
     torch.cuda.synchronize()
 
     for t in range(total_tiles):
-        e = tile_records_expert_id[t].item()
-        rows = tile_records_recv_x_rows[t].long()
-        x_gathered = recv_x[rows]
-        h = x_gathered.float() @ W1[e].float().t()
+        e = tile_to_expert_list[t]
+        x_tile = pool[t * tile_m:(t + 1) * tile_m, :]
+        h = x_tile.float() @ W1[e].float().t()
         a_ref = _swiglu_ref(h).to(dtype)
         diff = (postact_a[t].float() - a_ref.float()).abs()
         rel = diff / (a_ref.float().abs() + 1e-3)

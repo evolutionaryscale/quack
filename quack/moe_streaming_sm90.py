@@ -35,7 +35,6 @@ import cutlass.cute as cute
 import torch
 from cutlass import Int32, Int64
 
-from quack import copy_utils
 from quack.activation import gate_fn_map
 from quack.cache_utils import jit_cache, COMPILE_ONLY
 from quack.compile_utils import make_fake_tensor as fake_tensor
@@ -83,8 +82,10 @@ class StreamingMoeASm90(GemmGatedSm90):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Bump the scheduler-to-consumer SMEM payload from 4 ints
-        # (pid_m, pid_n, batch_idx, is_valid) to 5 ints (adds tile_id, used by
-        # the postact destination override).
+        # (pid_m, pid_n, batch_idx, is_valid) to 5 ints (adds tile_id). tile_id
+        # is not consumed by kernel A's mainloop or postact path — both use
+        # batch_idx + pid_m via cu_seqlens_m — but is propagated through the
+        # scheduler payload for forward compatibility with kernel Y / combine.
         self.sched_payload_ints = 5
 
     @cute.jit
@@ -139,55 +140,13 @@ class StreamingMoeASm90(GemmGatedSm90):
             persistence_mode=PersistenceMode.STREAMING,
         )
 
-    # -- postact destination override ----------------------------------------
-
-    def epi_setup_postact(
-        self,
-        params,
-        epi_smem_tensors,
-        tiled_copy_r2s,
-        tiled_copy_t2r,
-        tile_coord_mnkl,
-        varlen_manager,
-        tidx,
-    ):
-        """Override: postact destination is postact_a[tile_id * tile_M : ..., :].
-
-        Replaces the varlen path that uses cu_seqlens_m[batch_idx]. The mPostAct
-        tensor is passed flat as (total_tiles * tile_M, I) so a row offset of
-        tile_id * tile_M lands the per-tile slab.
-        """
-        import cutlass.utils.hopper_helpers as sm90_utils_og
-
-        sPostAct = epi_smem_tensors[self._epi_smem_map["mPostAct"]]
-        copy_atom_postact_r2s = sm90_utils_og.sm90_get_smem_store_op(
-            self.postact_layout, self.postact_dtype, self.acc_dtype
-        )
-        tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_r2s)
-        tRS_sPostAct = tiled_copy_postact_r2s.get_slice(tidx).partition_D(sPostAct)
-
-        tile_id = tile_coord_mnkl[2]
-        row_offset = tile_id * self.cta_tile_shape_mnk[0]
-        # The 2D postact tensor is wrapped as a ragged TMA tensor by
-        # setup_epi_tensor (rank 3, ptr_shift=True). Use offset_ragged_tensor
-        # to slice the per-tile slab.
-        mPostAct_tile = copy_utils.offset_ragged_tensor(
-            params.mPostAct,
-            row_offset,
-            self.cta_tile_shape_mnk[0],
-            ragged_dim=0,
-            ptr_shift=True,
-        )
-        copy_postact, _, _ = self.epilog_gmem_copy_and_partition(
-            params.tma_atom_mPostAct,
-            mPostAct_tile,
-            self.cta_tile_shape_postact_mn,
-            params.epi_tile_mPostAct,
-            sPostAct,
-            tile_coord_mnkl,
-        )
-        return tiled_copy_postact_r2s, tRS_sPostAct, copy_postact
-
+    # postact destination: inherited GemmGatedSm90.epi_setup_postact uses
+    # `varlen_manager.offset_batch_epi(mPostAct, batch_idx)` (shift by
+    # cu_seqlens_m[batch_idx]) + `local_tile((pid_m, pid_n))`. The combined
+    # row offset is `cu_seqlens_m[batch_idx] + pid_m * tile_m =
+    # expert_pool_block_offset[e] * tile_m + (tile_id - expert_pool_block_offset[e])
+    # * tile_m = tile_id * tile_m`, which lands postact_a's per-tile slab — no
+    # streaming-specific override needed.
 
 # ---------------------------------------------------------------------------
 # JIT compile factory.
