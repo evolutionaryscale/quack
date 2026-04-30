@@ -276,10 +276,6 @@ class GemmSm90:
 
         self.shared_storage = None
         self.buffer_align_bytes = 1024
-        # Number of int32s per scheduler-pipeline stage written to sched_smem.
-        # Default 4: (pid_m, pid_n, batch_idx, is_valid). Streaming subclasses
-        # bump this to 5 to also carry tile_id (the queue-pull index).
-        self.sched_payload_ints = 4
 
     def _setup_tiled_mma(self):
         """Set up tiled MMA and tile K dimension. Override for different MMA types."""
@@ -501,7 +497,7 @@ class GemmSm90:
             ab_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             epi_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.epi_c_stage * 2]
             sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.sched_stage * 2]
-            sched_data: cute.struct.MemRange[Int32, self.sched_stage * self.sched_payload_ints]
+            sched_data: cute.struct.MemRange[Int32, self.sched_stage * 4]
             sD: cute.struct.Align[
                 cute.struct.MemRange[
                     self.d_dtype if self.d_dtype is not None else Int32, epi_smem_size
@@ -651,7 +647,7 @@ class GemmSm90:
                 sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
                 varlen_k=varlen_k,
             )
-            sched_data = storage.sched_data.get_tensor((self.sched_payload_ints, self.sched_stage))
+            sched_data = storage.sched_data.get_tensor((4, self.sched_stage))
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk[:-1], is_relaxed=True)
