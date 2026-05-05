@@ -63,6 +63,7 @@ def _compile_gemm(
     rounding_mode,
     sr_seed_mode,
     has_trace_ptr,
+    has_lens_k,
 ):
     sm_to_cls = {
         9: GemmDefaultSm90,
@@ -114,7 +115,9 @@ def _compile_gemm(
         (is_dynamic_persistent and device_capacity[0] == 9), has_batch_idx_permute, l
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
-    varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
+    varlen_args = make_fake_varlen_args(
+        varlen_m, varlen_k, gather_A, aidx_len, lens_k=has_lens_k
+    )
     return compile_gemm_kernel(
         GemmCls,
         a_dtype,
@@ -160,6 +163,7 @@ def gemm(
     beta: float | Tensor = 1.0,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     cu_seqlens_k: Optional[Tensor] = None,  # (l+1,) cumulative sum of k values for variable length
+    lens_k: Optional[Tensor] = None,  # (l,) per-batch real K-length, decoupled from cu_seqlens_k storage offsets — TMA OOB-zero-fills past lens_k[b] in batch b's K-tile
     A_idx: Optional[Tensor] = None,  # (total_m,) or (total_k,) indices for gather_A when varlen
     batch_idx_permute: Optional[Tensor] = None,  # (l,) permutation of batch indices for scheduler
     add_to_output: bool = False,
@@ -171,9 +175,11 @@ def gemm(
 ) -> None:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
+    has_lens_k = lens_k is not None
     varlen = varlen_m or varlen_k
     gather_A = A_idx is not None
     assert not (varlen_m and varlen_k), "Only one of cu_seqlens_m and cu_seqlens_k"
+    assert not has_lens_k or varlen_k, "lens_k requires cu_seqlens_k"
     if gather_A:
         assert varlen, "gather_A requires varlen"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
@@ -241,6 +247,7 @@ def gemm(
         rounding_mode,
         sr_seed_mode,
         trace_ptr is not None,
+        has_lens_k,
     )
 
     from quack.cache_utils import COMPILE_ONLY
@@ -275,7 +282,7 @@ def gemm(
         tile_count_semaphore,
         batch_idx_permute,
     )
-    varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
+    varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, lens_k=lens_k)
 
     if device_capacity[0] in [10, 11]:
         compiled_fn(

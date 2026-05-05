@@ -17,6 +17,18 @@ class VarlenArguments(NamedTuple):
     mCuSeqlensM: Optional[cute.Tensor] = None
     mCuSeqlensK: Optional[cute.Tensor] = None
     mAIdx: Optional[cute.Tensor] = None
+    # Optional per-batch real K-length, decoupled from cu_seqlens_k storage
+    # offsets. When provided, `len_k(batch_idx)` and the `length` arg passed
+    # to `offset_ragged_tensor` (which controls TMA's OOB-zero-fill bound on
+    # the K-axis) come from `mLensK[batch_idx]` instead of the
+    # `cu_seqlens_k[batch_idx + 1] - cu_seqlens_k[batch_idx]` diff. This lets
+    # callers expose ragged storage that has padding TAILS per batch (e.g.
+    # tile-aligned per-expert blocks with unused trailing slots) and still
+    # have the GEMM K-loop iterate only the real K-rows + naturally
+    # zero-filled partial tile, instead of reading allocator garbage from
+    # the padding tail. Requires `mCuSeqlensK` to also be set (cu_seqlens_k
+    # still drives the per-batch storage offset).
+    mLensK: Optional[cute.Tensor] = None
 
 
 class VarlenManager:
@@ -25,6 +37,7 @@ class VarlenManager:
         cu_seqlens_m: Optional[cute.Tensor] = None
         cu_seqlens_k: Optional[cute.Tensor] = None
         mAIdx: Optional[cute.Tensor] = None
+        lens_k: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -33,6 +46,7 @@ class VarlenManager:
                 cu_seqlens_m=args.mCuSeqlensM,
                 cu_seqlens_k=args.mCuSeqlensK,
                 mAIdx=args.mAIdx,
+                lens_k=args.mLensK,
             )
 
     def __init__(
@@ -54,6 +68,7 @@ class VarlenManager:
         self.varlen_m = const_expr(params.cu_seqlens_m is not None)
         self.varlen_k = const_expr(params.cu_seqlens_k is not None)
         self.gather_A = const_expr(params.mAIdx is not None)
+        self.has_lens_k = const_expr(params.lens_k is not None)
         self._loc = loc
         self._ip = ip
 
@@ -83,7 +98,9 @@ class VarlenManager:
             return self._len_m_static
 
     def len_k(self, batch_idx: Int32) -> Int32:
-        if const_expr(self.varlen_k):
+        if const_expr(self.has_lens_k):
+            return self.params.lens_k[batch_idx]
+        elif const_expr(self.varlen_k):
             return self.params.cu_seqlens_k[batch_idx + 1] - self.params.cu_seqlens_k[batch_idx]
         else:
             return self._len_k_static
@@ -98,7 +115,15 @@ class VarlenManager:
             if const_expr(ragged_rank == 2):  # Didn't create ragged tensor
                 mA_mk = cute.domain_offset((None, offset), mA_mkl)
             else:
-                length = params.cu_seqlens_k[batch_idx + 1] - offset
+                # `length` controls TMA's OOB-zero-fill bound on the K-axis.
+                # When `mLensK` is provided, use the per-batch real length
+                # directly so the partial K-tile gets hardware-zero-filled
+                # past the real count; otherwise fall back to the cu_seqlens
+                # diff (= padded length when callers conflate offset and len).
+                if const_expr(self.has_lens_k):
+                    length = params.lens_k[batch_idx]
+                else:
+                    length = params.cu_seqlens_k[batch_idx + 1] - offset
                 # rank 3 = 1-extra-dim (ptr_shift), rank 4 = 2-extra-dim
                 ptr_shift = const_expr(ragged_rank == 3)
                 mA_mk = copy_utils.offset_ragged_tensor(
@@ -161,7 +186,12 @@ class VarlenManager:
             if const_expr(ragged_rank == 2):  # Didn't create ragged tensor
                 mB_nk = cute.domain_offset((None, offset), mB_nkl)
             else:
-                length = params.cu_seqlens_k[batch_idx + 1] - offset
+                # `length` controls TMA's OOB-zero-fill bound on the K-axis.
+                # See offset_batch_A for the mLensK rationale.
+                if const_expr(self.has_lens_k):
+                    length = params.lens_k[batch_idx]
+                else:
+                    length = params.cu_seqlens_k[batch_idx + 1] - offset
                 ptr_shift = const_expr(ragged_rank == 3)
                 mB_nk = copy_utils.offset_ragged_tensor(
                     mB_nkl,
