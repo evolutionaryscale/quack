@@ -30,15 +30,11 @@ class PersistenceMode(IntEnum):
     STATIC = 1
     DYNAMIC = 2
     CLC = 3
-    # STREAMING: persistent CTAs claim work via atomic_add on a dedicated
-    # consumer_head; each linear work index decomposes into (tile_id, pid_n).
-    # Each CTA acquire-spins on tile_ready[tile_id] (int64, dispatch_seq stamp)
-    # until the producer (DeepEP dispatch's Pass 2) releases the tile, then
-    # reads expert_id = tile_id_to_expert[tile_id] and computes
-    # pid_m = tile_id - expert_pool_block_offset[expert_id]. Pool layout means
-    # the pool row offset = cu_seqlens_m[expert_id] + pid_m * tile_m lands at
-    # the right rows via the standard varlen_m TMA path — no per-tile gather.
-    # Used by streaming-MoE kernel A.
+    # STREAMING: persistent CTAs pull work from an externally-produced queue
+    # (e.g. a separate kernel filling per-tile ready stamps on a different
+    # stream) and acquire-spin on a per-tile readiness signal before
+    # dispatching the math warps. Concrete scheduler subclasses implement
+    # the work-pull + per-tile spin; the base scheduler stays mode-agnostic.
     STREAMING = 4
 
 
