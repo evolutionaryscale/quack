@@ -190,6 +190,7 @@ class GemmBase:
                 varlen_manager,
                 tidx,
             )
+            tRS_rAuxOut_out = None
             if const_expr(aux_out_ctx is not None):
                 tRS_rAuxOut_out = self.epi_convert_aux_out(
                     tRS_rAuxOut,
@@ -199,47 +200,24 @@ class GemmBase:
                     num_prev_subtiles,
                     epi_idx,
                 )
-            if const_expr(use_tma_epi):
-                if is_tma_warp:
-                    epi_store_pipeline.producer_acquire()
-            else:
-                epilogue_barrier.arrive_and_wait()
-            if const_expr(use_tma_epi):
-                epilogue_barrier.arrive_and_wait()
-            epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
-            if const_expr(has_D):
-                tRS_sD_cur = tRS_sD[None, None, None, epi_buffer]
-                if const_expr(use_stochastic_rounding):
-                    seed = epilogue_sr_seed(
-                        epi_loop_tensors["sr_seed"], tile_coord_mnkl, num_prev_subtiles + epi_idx
-                    )
-                    copy_utils.sr_cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur, seed, tidx)
-                else:
-                    copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur)
-            if const_expr(aux_out_ctx is not None):
-                tiled_copy_aux_out_r2s, tRS_sAuxOut, copy_aux_out = aux_out_ctx
-                cute.copy(
-                    tiled_copy_aux_out_r2s,
-                    # Need contiguous for Sm80 and Sm120 where acc layout is ((2, 2), MMA_M, MMA_N)
-                    copy_utils.contiguous(tiled_copy_aux_out_r2s.retile(tRS_rAuxOut_out)),
-                    tRS_sAuxOut[None, None, None, epi_buffer],
-                )
-            if const_expr(use_tma_epi):
-                cute.arch.fence_view_async_shared()
-                epilogue_barrier.arrive_and_wait()
-                if is_tma_warp:
-                    if const_expr(has_D):
-                        copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
-                    if const_expr(aux_out_ctx is not None):
-                        copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
-                    epi_store_pipeline.producer_commit()
-            else:
-                epilogue_barrier.arrive_and_wait()
-                if const_expr(has_D):
-                    copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
-                if const_expr(aux_out_ctx is not None):
-                    copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
-                epilogue_barrier.arrive_and_wait()
+            self.epi_subtile_store(
+                params,
+                epi_loop_tensors,
+                tRS_rD,
+                tRS_sD,
+                tRS_rAuxOut_out,
+                tiled_copy_r2s,
+                copy_D,
+                aux_out_ctx,
+                epi_store_pipeline,
+                epilogue_barrier,
+                tile_coord_mnkl,
+                epi_coord,
+                num_prev_subtiles,
+                epi_idx,
+                tidx,
+                is_tma_warp,
+            )
 
         self.epi_end(
             params,
@@ -253,6 +231,83 @@ class GemmBase:
         )
 
         return epi_read_state, epi_producer_state
+
+    @cute.jit
+    def epi_subtile_store(
+        self,
+        params: "EpilogueParams",
+        epi_loop_tensors: Dict[str, cute.Tensor],
+        tRS_rD: cute.Tensor,
+        tRS_sD: cute.Tensor,
+        tRS_rAuxOut_out: Optional[cute.Tensor],
+        tiled_copy_r2s: cute.TiledCopy,
+        copy_D: Optional[Callable],
+        aux_out_ctx,
+        epi_store_pipeline: Optional[cutlass.pipeline.PipelineAsync],
+        epilogue_barrier: cutlass.pipeline.NamedBarrier,
+        tile_coord_mnkl: cute.Coord,
+        epi_coord: cute.Coord,
+        num_prev_subtiles: Int32,
+        epi_idx: Int32,
+        tidx: Int32,
+        is_tma_warp: cutlass.Boolean,
+    ) -> None:
+        """Per-subtile R2S → SMEM fence → store (TMA bulk store under
+        `use_tma_epi`, barrier-gated direct store otherwise).
+
+        Extension point: subclasses (e.g. streaming-MoE atomic-scatter
+        epilogues) override this to swap the store mechanism while keeping
+        the surrounding `epilogue()` orchestration intact. Default behavior
+        is identical to the previous inline path.
+        """
+        has_D = const_expr(copy_D is not None)
+        use_tma_epi = const_expr(epi_store_pipeline is not None)
+        use_stochastic_rounding = const_expr(
+            self.rounding_mode == RoundingMode.RS
+            and self.acc_dtype == cutlass.Float32
+            and self.d_dtype == cutlass.BFloat16
+        )
+        if const_expr(use_tma_epi):
+            if is_tma_warp:
+                epi_store_pipeline.producer_acquire()
+        else:
+            epilogue_barrier.arrive_and_wait()
+        if const_expr(use_tma_epi):
+            epilogue_barrier.arrive_and_wait()
+        epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
+        if const_expr(has_D):
+            tRS_sD_cur = tRS_sD[None, None, None, epi_buffer]
+            if const_expr(use_stochastic_rounding):
+                seed = epilogue_sr_seed(
+                    epi_loop_tensors["sr_seed"], tile_coord_mnkl, num_prev_subtiles + epi_idx
+                )
+                copy_utils.sr_cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur, seed, tidx)
+            else:
+                copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur)
+        if const_expr(aux_out_ctx is not None):
+            tiled_copy_aux_out_r2s, tRS_sAuxOut, copy_aux_out = aux_out_ctx
+            cute.copy(
+                tiled_copy_aux_out_r2s,
+                # Need contiguous for Sm80 and Sm120 where acc layout is ((2, 2), MMA_M, MMA_N)
+                copy_utils.contiguous(tiled_copy_aux_out_r2s.retile(tRS_rAuxOut_out)),
+                tRS_sAuxOut[None, None, None, epi_buffer],
+            )
+        if const_expr(use_tma_epi):
+            cute.arch.fence_view_async_shared()
+            epilogue_barrier.arrive_and_wait()
+            if is_tma_warp:
+                if const_expr(has_D):
+                    copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
+                if const_expr(aux_out_ctx is not None):
+                    copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
+                epi_store_pipeline.producer_commit()
+        else:
+            epilogue_barrier.arrive_and_wait()
+            if const_expr(has_D):
+                copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
+            if const_expr(aux_out_ctx is not None):
+                copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
+            epilogue_barrier.arrive_and_wait()
 
     def get_scheduler_class(self, varlen_m: bool = False):
         """Return the scheduler class to use. Override in subclasses for custom schedulers."""
