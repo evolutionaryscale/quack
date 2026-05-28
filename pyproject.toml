@@ -4,7 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quack-kernels"
-dynamic = ["version"]
+# Fork divergence: upstream uses `dynamic = ["version"]` with
+# `attr = "quack.__version__"`. That requires importing `quack/__init__.py`
+# during PEP 517 metadata resolution, which in turn imports
+# `quack.cute_dsl_elf_fix` (and transitively CuTeDSL) before its build deps are
+# installed — pixi's isolated build picks `0a0.dev0` as a fallback, breaking
+# sonic-moe's `quack-kernels>=0.3.11` constraint. Pin statically; bump on
+# upstream sync. When the streaming-MoE hooks land upstream and the fork is
+# dropped, this returns to `dynamic = ["version"]`.
+version = "0.4.1"
 requires-python = ">=3.10"
 dependencies = [
     "nvidia-cutlass-dsl>=4.4.2",
@@ -28,8 +36,9 @@ dev = [
 where = ["."]
 include = ["quack*"]
 
-[tool.setuptools.dynamic]
-version = {attr = "quack.__version__"}
+# Fork divergence: paired with the static `version = "0.4.1"` above.
+# [tool.setuptools.dynamic]
+# version = {attr = "quack.__version__"}
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
