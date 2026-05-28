@@ -17,6 +17,13 @@ class VarlenArguments(NamedTuple):
     mCuSeqlensM: Optional[cute.Tensor] = None
     mCuSeqlensK: Optional[cute.Tensor] = None
     mAIdx: Optional[cute.Tensor] = None
+    # Per-batch real K-length, independent of `mCuSeqlensK`. Used by streaming-
+    # MoE-style consumers where `mCuSeqlensK` encodes pool storage offsets
+    # (padded for alignment) but the GEMM should iterate over only the real
+    # K-tile count `ceil(mLensK[b] / tile_k)` instead of
+    # `ceil(cu_seqlens_k_diff[b] / tile_k)`. Optional: when `None`, K-length
+    # falls back to `cu_seqlens_k_diff` (existing behavior unchanged).
+    mLensK: Optional[cute.Tensor] = None
 
 
 class VarlenManager:
@@ -25,6 +32,7 @@ class VarlenManager:
         cu_seqlens_m: Optional[cute.Tensor] = None
         cu_seqlens_k: Optional[cute.Tensor] = None
         mAIdx: Optional[cute.Tensor] = None
+        lens_k: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -33,6 +41,7 @@ class VarlenManager:
                 cu_seqlens_m=args.mCuSeqlensM,
                 cu_seqlens_k=args.mCuSeqlensK,
                 mAIdx=args.mAIdx,
+                lens_k=args.mLensK,
             )
 
     def __init__(
@@ -54,6 +63,7 @@ class VarlenManager:
         self.varlen_m = const_expr(params.cu_seqlens_m is not None)
         self.varlen_k = const_expr(params.cu_seqlens_k is not None)
         self.gather_A = const_expr(params.mAIdx is not None)
+        self.has_lens_k = const_expr(params.lens_k is not None)
         self._loc = loc
         self._ip = ip
 
@@ -83,7 +93,13 @@ class VarlenManager:
             return self._len_m_static
 
     def len_k(self, batch_idx: Int32) -> Int32:
-        if const_expr(self.varlen_k):
+        # Real K-length override decouples per-batch tile count from
+        # cu_seqlens_k. When `lens_k` is supplied, return it directly so
+        # callers iterate `ceil(lens_k[b] / tile_k)` tiles instead of
+        # `ceil(cu_seqlens_k_diff[b] / tile_k)`.
+        if const_expr(self.has_lens_k):
+            return self.params.lens_k[batch_idx]
+        elif const_expr(self.varlen_k):
             return self.params.cu_seqlens_k[batch_idx + 1] - self.params.cu_seqlens_k[batch_idx]
         else:
             return self._len_k_static
@@ -98,7 +114,15 @@ class VarlenManager:
             if const_expr(ragged_rank == 2):  # Didn't create ragged tensor
                 mA_mk = cute.domain_offset((None, offset), mA_mkl)
             else:
-                length = params.cu_seqlens_k[batch_idx + 1] - offset
+                # `length` bounds the TMA OOB-fill: rows beyond `length` are
+                # treated as zero on load. Under `has_lens_k` (streaming-MoE)
+                # the real K-length is `lens_k[b]`, smaller than the padded
+                # `cu_seqlens_k_diff[b]`; using it ensures the GEMM doesn't
+                # touch padded rows even when the inner-loop count would.
+                if const_expr(self.has_lens_k):
+                    length = params.lens_k[batch_idx]
+                else:
+                    length = params.cu_seqlens_k[batch_idx + 1] - offset
                 # rank 3 = 1-extra-dim (ptr_shift), rank 4 = 2-extra-dim
                 ptr_shift = const_expr(ragged_rank == 3)
                 mA_mk = copy_utils.offset_ragged_tensor(
@@ -161,7 +185,12 @@ class VarlenManager:
             if const_expr(ragged_rank == 2):  # Didn't create ragged tensor
                 mB_nk = cute.domain_offset((None, offset), mB_nkl)
             else:
-                length = params.cu_seqlens_k[batch_idx + 1] - offset
+                # See offset_batch_A: `has_lens_k` overrides the K-length for
+                # TMA OOB-fill semantics.
+                if const_expr(self.has_lens_k):
+                    length = params.lens_k[batch_idx]
+                else:
+                    length = params.cu_seqlens_k[batch_idx + 1] - offset
                 ptr_shift = const_expr(ragged_rank == 3)
                 mB_nk = copy_utils.offset_ragged_tensor(
                     mB_nkl,

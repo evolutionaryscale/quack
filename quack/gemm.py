@@ -58,6 +58,7 @@ def _compile_gemm(
     varlen_m,
     varlen_k,
     gather_A,
+    has_lens_k,
     use_tma_gather,
     has_batch_idx_permute,
     device_capacity,
@@ -117,7 +118,7 @@ def _compile_gemm(
         (is_dynamic_persistent and device_capacity[0] <= 9), has_batch_idx_permute, l
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
-    varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
+    varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len, lens_k=has_lens_k)
     return compile_gemm_kernel(
         GemmCls,
         a_dtype,
@@ -166,6 +167,12 @@ def gemm(
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     cu_seqlens_k: Optional[Tensor] = None,  # (l+1,) cumulative sum of k values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) or (total_k,) indices for gather_A when varlen
+    # (l,) per-batch real K-length, independent of `cu_seqlens_k`. When supplied,
+    # the K-tile count and TMA OOB-fill bound switch from
+    # `cu_seqlens_k_diff[b]` to `lens_k[b]`. Used by streaming-MoE consumers
+    # where `cu_seqlens_k` encodes padded pool offsets but only the real
+    # `lens_k[b]` rows participate in the GEMM. Requires `cu_seqlens_k`.
+    lens_k: Optional[Tensor] = None,
     batch_idx_permute: Optional[Tensor] = None,  # (l,) permutation of batch indices for scheduler
     add_to_output: bool = False,
     rounding_mode: int = RoundingMode.RN,
@@ -179,7 +186,9 @@ def gemm(
     varlen_k = cu_seqlens_k is not None
     varlen = varlen_m or varlen_k
     gather_A = A_idx is not None
+    has_lens_k = lens_k is not None
     assert not (varlen_m and varlen_k), "Only one of cu_seqlens_m and cu_seqlens_k"
+    assert not has_lens_k or varlen_k, "lens_k requires cu_seqlens_k"
     if gather_A:
         assert varlen, "gather_A requires varlen"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
@@ -246,6 +255,7 @@ def gemm(
         varlen_m,
         varlen_k,
         gather_A,
+        has_lens_k,
         use_tma_gather,
         batch_idx_permute is not None,
         device_capacity,
@@ -288,7 +298,7 @@ def gemm(
         tile_count_semaphore,
         batch_idx_permute,
     )
-    varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
+    varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, lens_k=lens_k)
 
     if device_capacity[0] in [10, 11]:
         compiled_fn(

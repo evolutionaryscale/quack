@@ -87,20 +87,26 @@ def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym):
     )
 
 
-def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx):
+def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, lens_k=None):
     if cu_seqlens_m is None and cu_seqlens_k is None:
         return None
     return VarlenArguments(
         mCuSeqlensM=cu_seqlens_m,
         mCuSeqlensK=cu_seqlens_k,
         mAIdx=A_idx,
+        mLensK=lens_k,
     )
 
 
-def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len):
+def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len, lens_k=False):
     if not varlen_m and not varlen_k:
         return None
     num_seqlens = cute.sym_int()
+    # `lens_k` has its own batch count sym so the compile cache key separates
+    # the lens_k-supplied case from the lens_k=None case. Conceptually
+    # lens_k.shape == (l,) where l = cu_seqlens_k.shape[0] - 1, but the dual
+    # sym keeps the cache entry shape-distinct.
+    num_batches = cute.sym_int() if lens_k else None
     return VarlenArguments(
         mCuSeqlensM=(
             fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4) if varlen_m else None
@@ -110,6 +116,9 @@ def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len):
         ),
         mAIdx=(
             fake_tensor(Int32, (aidx_len,), leading_dim=0, divisibility=4) if gather_A else None
+        ),
+        mLensK=(
+            fake_tensor(Int32, (num_batches,), leading_dim=0, divisibility=4) if lens_k else None
         ),
     )
 
